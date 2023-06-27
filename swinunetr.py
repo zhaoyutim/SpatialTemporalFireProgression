@@ -13,18 +13,17 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-
 import torch
 import numpy as np
 import torch.nn as nn
+from torch.autograd import profiler
 from torchinfo import summary
 
-from swin import SwinTransformer
+from model.swin import SwinTransformer
 from typing import Sequence, Tuple, Union
 
 from monai.utils import ensure_tuple_rep
 from monai.networks.blocks import UnetOutBlock, UnetrBasicBlock, UnetrUpBlock
-
 
 __all__ = ['SwinUNETR']
 
@@ -101,8 +100,8 @@ class SwinUNETR(nn.Module):
         # if feature_size % 4 != 0:
         #     raise ValueError('feature_size should be divisible by 4.')
 
-        if attn_version not in ['v1', 'v2']:
-            raise ValueError('attn_version should be v1 or v2.')
+        if attn_version not in ['v1', 'v2', 'ar']:
+            raise ValueError('attn_version should be v1 or v2 or ar.')
 
         self.normalize = normalize
 
@@ -232,7 +231,9 @@ class SwinUNETR(nn.Module):
                 out_channels = out_channels
             ),
             nn.Sigmoid()
+            # nn.Softmax()
         )
+
 
     def forward(self, x_in):
         hidden_states_out = self.swinViT(x_in, self.normalize)
@@ -261,7 +262,7 @@ if __name__ == '__main__':
     image_size = (8, 512, 512)
     patch_size = (1, 2, 2)
     window_size = (2, 7, 7)
-    x = torch.rand(B, C, 8, 256, 256)
+
 
     model = SwinUNETR(
         image_size     = image_size,
@@ -276,11 +277,19 @@ if __name__ == '__main__':
         drop_rate      = 0.0,
         attn_drop_rate = 0.0,
         drop_path_rate = 0.0,
-        attn_version   = 'v2',
+        attn_version   = 'ar',
         normalize      = True,
         use_checkpoint = False,
         spatial_dims   = 3
     )
-    summary(model, (C, 8, 512, 512), batch_dim=0)
-    output = model(x)
+
+
+    device = torch.device("cuda:9" if torch.cuda.is_available() else "cpu")
+    model.to(device)
+    x = torch.rand(B, C, 8, 256, 256).cuda(device=device)
+    summary(model, (C, 8, 512, 512), batch_dim=0, device="cuda:9")
+    with profiler.profile(with_stack=True, profile_memory=True) as prof:
+        # out, idx = model(input, mask)
+        output = model(x)
     print(output.size())
+    print(prof.key_averages(group_by_stack_n=5).table(sort_by='self_cpu_time_total', row_limit=5))

@@ -1,38 +1,44 @@
 import argparse
 import heapq
 import platform
-
-
+import os
+os.environ["CUDA_VISIBLE_DEVICES"] = "7,8,9,10"
+import numpy as np
 import torch
-import wandb
-from swinunetr import SwinUNETR
+SEED = 42
+np.random.seed(SEED)
+torch.manual_seed(SEED)
+from monai.losses.dice import DiceLoss
+from monai.metrics import MeanIoU, DiceMetric
 from torch import nn, optim
+from torch.cuda.amp import GradScaler
 from torch.utils.data import DataLoader
 from torchinfo import summary
-
+from tqdm import tqdm
+import wandb
 from FireDataset import FireDataset
+from swinunetr import SwinUNETR
+import torchvision.transforms as transforms
+
 
 if platform.system() == 'Darwin':
     root_path = 'data'
 
 else:
-    root_path = '/geoinfo_vol1/zhao2/proj5_dataset'
+    root_path = '/geoinfo_vol1/home/z/h/zhao2/CalFireMonitoring/'
 
-def wandb_config(model_name, run, num_heads, num_layers, mlp_dim, hidden_size):
+def wandb_config(model_name, num_heads, hidden_size, batch_size):
     wandb.login()
     # wandb.init(project="tokenized_window_size" + str(window_size) + str(model_name) + 'run' + str(run), entity="zhaoyutim")
-    wandb.init(project="proj3_"+model_name+"_grid_search", entity="zhaoyutim")
-    wandb.run.name = 'num_heads_' + str(num_heads) + 'num_layers_'+ str(num_layers)+ 'mlp_dim_'+str(mlp_dim)+'hidden_size_'+str(hidden_size)+'batchsize_'+str(batch_size)+'run_'+str(run)
+    wandb.init(project="proj5_"+model_name+"_grid_search", entity="zhaoyutim")
+    wandb.run.name = 'num_heads_' + str(num_heads) +'hidden_size_'+str(hidden_size)+'batchsize_'+str(batch_size)
     wandb.config = {
         "learning_rate": learning_rate,
         "weight_decay": weight_decay,
         "epochs": MAX_EPOCHS,
         "batch_size": batch_size,
-        "num_heads": num_heads,
-        "num_layers": num_layers,
-        "mlp_dim": mlp_dim,
-        "embed_dim": hidden_size
     }
+
 
 if __name__=='__main__':
     import os
@@ -41,143 +47,230 @@ if __name__=='__main__':
     parser.add_argument('-b', type=int, help='batch size')
     parser.add_argument('-r', type=int, help='run')
     parser.add_argument('-lr', type=float, help='learning rate')
+    parser.add_argument('-av', type=str, help='attension version')
 
-    # parser.add_argument('-nh', type=int, help='number-of-head')
+    parser.add_argument('-nh', type=int, help='number-of-head')
     # parser.add_argument('-md', type=int, help='mlp-dimension')
-    # parser.add_argument('-ed', type=int, help='embedding dimension')
+    parser.add_argument('-ed', type=int, help='embedding dimension')
     # parser.add_argument('-nl', type=int, help='num_layers')
 
     args = parser.parse_args()
     model_name = args.m
     batch_size = args.b
 
-    # num_heads=args.nh
+    num_heads=args.nh
     # mlp_dim=args.md
     # num_layers=args.nl
-    # hidden_size=args.ed
+    hidden_size=args.ed
 
     run = args.r
     lr = args.lr
-    MAX_EPOCHS = 50
+    MAX_EPOCHS = 200
     learning_rate = lr
     weight_decay = lr / 10
-    num_classes=2
-    ts_length=10
+    num_classes = 2
+    n_channel = 6
+    ts_length = 8
     top_n_checkpoints = 3
+    train = False
+    attn_version=args.av
 
-    # wandb_config(model_name, run, num_heads, mlp_dim, num_layers, hidden_size)
+    class Normalize(object):
+        def __init__(self, mean, std):
+            self.mean = mean
+            self.std = std
+
+        def __call__(self, sample):
+            for i in range(len(self.mean)):
+                sample[:, i, ...] = (sample[:, i, ...] - self.mean[i]) / self.std[i]
+            return sample
+
+    transform = Normalize(mean=[-0.02396825, -0.00982363, -0.03872192, -0.04996127, -0.0444024, -0.04294463],
+                          std=[0.9622167, 0.9731459, 0.96916544, 0.96462715, 0.9488478, 0.965671])
 
     # Dataloader
-    image_path = os.path.join(root_path, 'proj5_train_img_seqtoseq_l' + str(ts_length) + '.npy')
-    label_path = os.path.join(root_path, 'proj5_train_label_seqtoseq_l' + str(ts_length) + '.npy')
-    val_image_path = os.path.join(root_path, 'proj5_train_img_seqtoseq_l' + str(ts_length) + '.npy')
-    val_label_path = os.path.join(root_path, 'proj5_train_label_seqtoseq_l' + str(ts_length) + '.npy')
-    train_dataset = FireDataset(image_path=image_path, label_path=label_path)
-    train_dataloader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
-    val_dataset = FireDataset(image_path=val_image_path, label_path=val_label_path)
-    val_dataloader = DataLoader(val_dataset, batch_size=batch_size, shuffle=True)
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    if train:
+        wandb_config(model_name, num_heads, hidden_size, batch_size)
+        image_path = os.path.join(root_path, 'data_train_proj5/proj5_train_img_seqtoseq_alll_' + str(ts_length) + '.npy')
+        label_path = os.path.join(root_path, 'data_train_proj5/proj5_train_label_seqtoseq_alll_' + str(ts_length) + '.npy')
+        val_image_path = os.path.join(root_path, 'data_val_proj5/proj5_val_img_seqtoseql_' + str(ts_length) + '.npy')
+        val_label_path = os.path.join(root_path, 'data_val_proj5/proj5_val_label_seqtoseql_' + str(ts_length) + '.npy')
+        train_dataset = FireDataset(image_path=image_path, label_path=label_path, transform=transform)
+        train_dataloader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
+        val_dataset = FireDataset(image_path=val_image_path, label_path=val_label_path, transform=transform)
+        val_dataloader = DataLoader(val_dataset, batch_size=batch_size, shuffle=True)
+    else:
+        test_image_path = os.path.join(root_path, 'data_test_proj5/proj5_24332628_img_seqtoseql_' + str(ts_length) + '.npy')
+        test_label_path = os.path.join(root_path, 'data_test_proj5/proj5_24332628_label_seqtoseql_' + str(ts_length) + '.npy')
+        test_dataset = FireDataset(image_path=test_image_path, label_path=test_label_path, transform=transform)
+        test_dataloader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False)
 
-    image_size = (8, 512, 512)
+    device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+
+    image_size = (8, 256, 256)
     patch_size = (1, 2, 2)
-    window_size = (2, 7, 7)
+    window_size = (ts_length, 4, 4)
 
     model = SwinUNETR(
         image_size=image_size,
         patch_size=patch_size,
         window_size=window_size,
-        in_channels=6,
+        in_channels=n_channel,
         out_channels=2,
         depths=(2, 2, 2, 2),
-        num_heads=(4, 8, 12, 16),
-        feature_size=24,
+        num_heads=(num_heads, 2*num_heads, 3*num_heads, 4*num_heads),
+        feature_size=hidden_size,
         norm_name='batch',
         drop_rate=0.0,
         attn_drop_rate=0.0,
         drop_path_rate=0.0,
-        attn_version='v2',
+        attn_version=attn_version,
         normalize=True,
         use_checkpoint=False,
         spatial_dims=3
-    ).to(device)
+    )
+    model = nn.DataParallel(model)
+    model.to(device)
 
-    summary(model, (6, 8, 512, 512), batch_dim=0)
-    criterion = nn.CrossEntropyLoss()
-    optimizer = optim.Adam(model.parameters(), lr=lr)
+    summary(model, (n_channel, 8, 256, 256), batch_dim=0, device=device)
+    criterion = DiceLoss(reduction='mean')
+    mean_iou = MeanIoU(include_background=True, reduction="mean")
+    dice_metric = DiceMetric(include_background=True, reduction="mean")
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    optimizer = optim.SGD(model.parameters(), lr=lr)
+    scaler = GradScaler()
     model.to(device)
     best_checkpoints = []
-    for epoch in range(MAX_EPOCHS):
-        model.train()
-        train_loss = 0.0
+    if train:
+        # create a progress bar for the training loop
+        for epoch in range(MAX_EPOCHS):
+            model.train()
+            train_loss = 0.0
+            train_bar = tqdm(train_dataloader, total=len(train_dataloader))
+            for i, batch in enumerate(train_bar):
+                data_batch = batch['data'].to(device)
+                labels_batch = batch['labels'].to(torch.long).to(device)
 
-        for batch in train_dataloader:
-            data_batch = batch['data'].to(device)
-            labels_batch = batch['labels'].to(device)
+                optimizer.zero_grad()
+                with torch.cuda.amp.autocast():
+                    outputs = model(data_batch)
+                    loss = criterion(outputs, labels_batch)
+                scaler.scale(loss).backward()
+                scaler.step(optimizer)
+                scaler.update()
 
-            optimizer.zero_grad()
+                train_loss += loss.detach().item() * data_batch.size(0)
+                train_bar.set_description(f"Epoch {epoch}/{MAX_EPOCHS}, Loss: {train_loss/((i+1)* data_batch.size(0)):.4f}")
 
-            outputs = model(data_batch)
-            loss = criterion(outputs, labels_batch)
-            loss.backward()
-            optimizer.step()
+            train_loss /= len(train_dataset)
+            wandb.log({'train_loss': train_loss})
 
-            train_loss += loss.item() * data_batch.size(0)
+            print(f"Epoch {epoch + 1}, Train Loss: {train_loss:.4f}")
+            wandb.log({'epoch': epoch})
 
-        train_loss /= len(train_dataset)
-        print(f"Epoch {epoch + 1}, Train Loss: {train_loss:.4f}")
+            model.eval()
+            val_loss = 0.0
+            iou_values = []
+            dice_values = []
+            val_bar = tqdm(val_dataloader, total=len(val_dataloader))
+            for j, batch in enumerate(val_bar):
+                val_data_batch = batch['data'].to(device)
+                val_labels_batch = batch['labels'].to(device)
 
-        model.eval()
-        val_loss = 0.0
+                outputs = model(val_data_batch)
+                loss = criterion(outputs, val_labels_batch)
 
-        for batch in val_dataloader:
-            data_batch = batch['data'].to(device)
-            labels_batch = batch['labels'].to(device)
+                val_loss += loss.detach().item() * val_data_batch.size(0)
+                iou_values.append(mean_iou(outputs, val_labels_batch).mean().item())
+                dice_values.append(dice_metric(y_pred=outputs, y=val_labels_batch).mean().item())
+                val_bar.set_description(
+                    f"Epoch {epoch}/{MAX_EPOCHS}, Loss: {val_loss / ((j + 1) * val_data_batch.size(0)):.4f}")
 
-            outputs = model(data_batch)
-            loss = criterion(outputs, labels_batch)
+            val_loss /= len(val_dataset)
+            mean_iou_val = np.mean(iou_values)
+            mean_dice_val = np.mean(dice_values)
+            wandb.log({'val_loss': val_loss, 'miou': mean_iou_val, 'mdice': mean_iou_val})
+            print(f"Epoch {epoch + 1}, Validation Loss: {val_loss:.4f}, Mean IoU: {mean_iou_val:.4f}, Mean Dice: {mean_dice_val:.4f}")
 
-            val_loss += loss.item() * data_batch.size(0)
+            # Save the top N model checkpoints based on validation loss
+            if len(best_checkpoints) < top_n_checkpoints or val_loss < best_checkpoints[0][0]:
+                save_path = f"num_heads_{num_heads}_hidden_size_{hidden_size}_batchsize_{batch_size}_checkpoint_epoch_{epoch + 1}_attention_{attn_version}.pth"
 
-        val_loss /= len(val_dataset)
-        print(f"Epoch {epoch + 1}, Validation Loss: {val_loss:.4f}")
+                if len(best_checkpoints) == top_n_checkpoints:
+                    # Remove the checkpoint with the highest validation loss
+                    _, remove_checkpoint = heapq.heappop(best_checkpoints)
+                    if os.path.exists(remove_checkpoint):
+                        os.remove(remove_checkpoint)
 
-        # Save the top N model checkpoints based on validation loss
-        if len(best_checkpoints) < top_n_checkpoints or val_loss < best_checkpoints[0][0]:
-            save_path = f"checkpoint_epoch_{epoch + 1}.pth"
+                # Save the new checkpoint
+                torch.save({
+                    'epoch': epoch,
+                    'model_state_dict': model.state_dict(),
+                    'optimizer_state_dict': optimizer.state_dict(),
+                    'loss': loss,
+                }, save_path)
 
-            if len(best_checkpoints) == top_n_checkpoints:
-                # Remove the checkpoint with the highest validation loss
-                _, remove_checkpoint = heapq.heappop(best_checkpoints)
-                os.remove(remove_checkpoint)
+                # Add the new checkpoint to the priority queue
+                heapq.heappush(best_checkpoints, (val_loss, save_path))
 
-            # Save the new checkpoint
-            torch.save({
-                'epoch': epoch,
-                'model_state_dict': model.state_dict(),
-                'optimizer_state_dict': optimizer.state_dict(),
-                'loss': loss,
-            }, save_path)
+                # Ensure that the priority queue has at most N elements
+                best_checkpoints = heapq.nlargest(top_n_checkpoints, best_checkpoints)
+        print("Top N best checkpoints:")
+        for _, checkpoint in best_checkpoints:
+            print(checkpoint)
+    else:
+        # Load the model checkpoint
+        load_epoch = 200
+        load_path = f"num_heads_{num_heads}_hidden_size_{hidden_size}_batchsize_{batch_size}_checkpoint_epoch_{load_epoch}_attention_{attn_version}.pth"
 
-            # Add the new checkpoint to the priority queue
-            heapq.heappush(best_checkpoints, (-val_loss, save_path))
+        checkpoint = torch.load(load_path)
+        model.load_state_dict(checkpoint['model_state_dict'])
+        optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+        loaded_epoch = checkpoint['epoch']
+        loaded_loss = checkpoint['loss']
 
-            # Ensure that the priority queue has at most N elements
-            best_checkpoints = heapq.nsmallest(top_n_checkpoints, best_checkpoints)
-    print("Top N best checkpoints:")
-    for _, checkpoint in best_checkpoints:
-        print(checkpoint)
-# # Load the model checkpoint
-# load_path = "checkpoint.pth"
-#
-# checkpoint = torch.load(load_path)
-# model.load_state_dict(checkpoint['model_state_dict'])
-# optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-# loaded_epoch = checkpoint['epoch']
-# loaded_loss = checkpoint['loss']
-#
-# # Make sure to set the model to eval or train mode after loading
-# model.eval()  # or model.train()
+        # Make sure to set the model to eval or train mode after loading
+        model.eval()  # or model.train()
+        def normalization(array):
+            return (array-array.min()) / (array.max() - array.min())
+
+
+        output_stack = np.zeros((256, 256))
+        for j, batch in enumerate(test_dataloader):
+            test_data_batch = batch['data']
+            test_labels_batch = batch['labels']
+            outputs = model(test_data_batch.to(device)).cpu().detach().numpy()
+            import matplotlib.pyplot as plt
+
+            for k in range(test_data_batch.shape[0]):
+                for i in range(ts_length):
+                    if j==2 and k==0 and i==7:
+                        output_stack = np.zeros((256, 256))
+                    output_stack = np.logical_or(output_stack, outputs[k, 1, i, :, :]>0.5)
+                    ba_img = np.zeros((256,256,3))
+                    ba_img[:,:,0] = normalization(test_data_batch[k, 5, i, :, :])
+                    ba_img[:, :, 1] = normalization(test_data_batch[k, 1, i, :, :])
+                    ba_img[:, :, 2] = normalization(test_data_batch[k, 0, i, :, :])
+
+                    f, axarr = plt.subplots(2, 2)
+                    axarr[0, 0].imshow(output_stack)
+                    axarr[0, 0].set_title('Prediction')
+                    axarr[0, 0].axis('off')
+
+                    axarr[0, 1].imshow(normalization(test_data_batch[k, 1, i, :, :]))
+                    axarr[0, 1].set_title('VIIRS I4 Day')
+                    axarr[0, 1].axis('off')
+
+                    axarr[1, 0].imshow(test_labels_batch[k, 1, i, :, :]>0.5)
+                    axarr[1, 0].set_title('Ground Truth')
+                    axarr[1, 0].axis('off')
+
+                    axarr[1, 1].imshow(normalization(test_data_batch[k, 4, i, :, :]))
+                    axarr[1, 1].set_title('VIIRS I4 Night')
+                    axarr[1, 1].axis('off')
+
+                    f.savefig('results/nhead_{}_hidden_{}_nbatch_{}_nseries_{}_ts_{}_av_{}.png'.format(num_heads, hidden_size, j, k, i, attn_version), bbox_inches='tight')
+                    plt.show()
+
 
 

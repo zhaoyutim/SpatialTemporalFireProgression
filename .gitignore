@@ -1,3 +1,9 @@
 .idea
 __pycache__
 data
+*.pth
+*.pt
+._.DS_Store
+results
+wandb
+temp_mask_test
