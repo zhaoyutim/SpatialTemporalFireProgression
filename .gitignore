@@ -1,4 +1,6 @@
 .idea
+.vscode
+dataset_inspect
 __pycache__
 data
 *.pth
@@ -7,3 +9,8 @@ data
 results
 wandb
 temp_mask_test
+results_0912
+trained_model
+
+wandb
+.DS_Store

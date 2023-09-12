@@ -18,10 +18,12 @@ class Normalize(object):
         return sample
 
 class FireDataset(Dataset):
-    def __init__(self, image_path, label_path, transform=None):
+    def __init__(self, image_path, label_path, transform=None, n_channel=8, label_sel=2):
         self.image_path, self.label_path = image_path, label_path
         self.num_samples = np.load(self.image_path).shape[0]
         self.transform = transform
+        self.n_channel = n_channel
+        self.label_sel = label_sel
 
     def __len__(self):
         return self.num_samples
@@ -44,10 +46,12 @@ class FireDataset(Dataset):
         data_chunk = np.load(self.image_path, mmap_mode='r')[indices]
         label_chunk = np.load(self.label_path, mmap_mode='r')[indices]
 
-        img_dataset = data_chunk[2:, :8, :, :]
-        af_dataset = label_chunk[[1], :8, :, :]
-        label_dataset = label_chunk[[2], :8, :, :]
-
+        if self.n_channel==6:
+            img_dataset = data_chunk[2:, :8, :, :]
+        else:
+            img_dataset = data_chunk[:, :8, :, :]
+        label_dataset = label_chunk[[self.label_sel], :8, :, :]
+        # 0 NIFC 1 VIIRS AF ACC 2 combine
         y_dataset = np.zeros((2, 8,256,256))
         # y_dataset = np.where(label_dataset > 0, 1, 0)
         # y_dataset = np.where(af_dataset > 0, 2, y_dataset)
